@@ -173,8 +173,7 @@ export default function AutoMatchesPage() {
       )
     );
   };
-
-  // 5) 試合結果を保存して、次の試合を割り当て
+  // 5) 試合結果を保存して、レートを更新し、次の試合を割り当て
   const handleSaveResult = async (match: MatchInProgress) => {
     if (!match.winnerId) {
       alert("勝者を選択してください");
@@ -183,23 +182,83 @@ export default function AutoMatchesPage() {
 
     setSaving(true);
 
-    // 試合結果を DB に保存（player_a / player_b / winner）
-    const { error } = await supabase.from("matches").insert({
-      player_a: match.player1.id,
-      player_b: match.player2.id,
-      winner: match.winnerId,
-      // created_at は Supabase 側の default に任せる
-    });
+    // ---- ① 勝者・敗者の Player を allPlayers から取得（最新レート） ----
+    const winnerPlayer = allPlayers.find((p) => p.id === match.winnerId);
+    const loserId =
+      match.player1.id === match.winnerId
+        ? match.player2.id
+        : match.player1.id;
+    const loserPlayer = allPlayers.find((p) => p.id === loserId);
 
-    setSaving(false);
-
-    if (error) {
-      console.error("saveResult error:", error);
-      alert("試合結果の保存に失敗しました");
+    if (!winnerPlayer || !loserPlayer) {
+      alert("選手情報の取得に失敗しました");
+      setSaving(false);
       return;
     }
 
-    // ① sameDayPairs を更新（この日、この2人は対戦済み）
+    // ---- ② Eloで新しいレートを計算（Home画面と同じロジック） ----
+    const k = 32;
+    const expectedW =
+      1 / (1 + Math.pow(10, (loserPlayer.rating - winnerPlayer.rating) / 400));
+    const expectedL =
+      1 / (1 + Math.pow(10, (winnerPlayer.rating - loserPlayer.rating) / 400));
+
+    const newWRating = Math.round(
+      winnerPlayer.rating + k * (1 - expectedW)
+    );
+    const newLRating = Math.round(
+      loserPlayer.rating + k * (0 - expectedL)
+    );
+
+    // ---- ③ matches テーブルに試合結果を保存（player_a / player_b / winner）----
+    const { error: matchError } = await supabase.from("matches").insert({
+      player_a: match.player1.id,
+      player_b: match.player2.id,
+      winner: match.winnerId,
+      // created_at は Supabase 側に任せる
+    });
+
+    if (matchError) {
+      console.error("saveResult error:", matchError);
+      alert("試合結果の保存に失敗しました");
+      setSaving(false);
+      return;
+    }
+
+    // ---- ④ players テーブルのレーティングを更新 ----
+    const { error: winnerUpdateError } = await supabase
+      .from("players")
+      .update({ rating: newWRating })
+      .eq("id", winnerPlayer.id);
+
+    const { error: loserUpdateError } = await supabase
+      .from("players")
+      .update({ rating: newLRating })
+      .eq("id", loserPlayer.id);
+
+    if (winnerUpdateError || loserUpdateError) {
+      console.error("rating update error:", {
+        winnerUpdateError,
+        loserUpdateError,
+      });
+      // 試合結果は保存済みなので、そのことは知らせておく
+      alert("試合結果は保存されましたが、レーティング更新に失敗しました");
+    } else {
+      // ローカル状態のレートも更新しておく
+      setAllPlayers((prev) =>
+        prev.map((p) => {
+          if (p.id === winnerPlayer.id) {
+            return { ...p, rating: newWRating };
+          }
+          if (p.id === loserPlayer.id) {
+            return { ...p, rating: newLRating };
+          }
+          return p;
+        })
+      );
+    }
+
+    // ---- ⑤ sameDayPairs を更新（この日、この2人は対戦済み）----
     const updatedSameDayPairs = addPairToSameDaySet(
       sameDayPairs,
       match.player1.id,
@@ -207,16 +266,14 @@ export default function AutoMatchesPage() {
     );
     setSameDayPairs(updatedSameDayPairs);
 
-    // ② 待ち試合キューから次の1試合を取り出す
+    // ---- ⑥ 待ち試合キューから次の1試合を取り出す & 台を入れ替え ----
     const newWaiting = [...waitingMatches];
     const nextMatch = newWaiting.shift() ?? null;
 
-    // ③ 現在進行中から、この台の試合を削除
     const newCurrent = currentMatches.filter(
       (m) => m.tableNumber !== match.tableNumber
     );
 
-    // ④ 待ち試合が残っていれば、その台に次の試合を割り当て
     if (nextMatch) {
       newCurrent.push({
         ...nextMatch,
@@ -224,14 +281,15 @@ export default function AutoMatchesPage() {
       });
     }
 
-    // ⑤ 状態をまとめて更新
     setCurrentMatches(newCurrent);
     setWaitingMatches(newWaiting);
 
-    // ⑥ 待ち試合も現在進行中もなくなったら「本日終了」
+    // ---- ⑦ もう試合がなければ終了フラグ ----
     if (newCurrent.length === 0 && newWaiting.length === 0) {
       setFinished(true);
     }
+
+    setSaving(false);
   };
 
   // 6) 本日の割り当て終了（強制終了）
