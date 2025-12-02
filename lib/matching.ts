@@ -35,21 +35,24 @@ function makePairKey(a: string, b: string): string {
 
 type GenerateScheduleOptions = {
   players: Player[];
-  sameDayPairs: Set<string>; // その日以前の「既に対戦済みペア」
-  matchesPerPlayer: number; // 今回は 10 固定で呼ぶ
+  sameDayPairs: Set<string>; // その日すでに対戦済みのペア（DBから取得済み）
+  matchesPerPlayer: number;  // 1人あたりの最大試合数（原則 人数-1）
 };
 
 /**
- * 各選手が最大 matchesPerPlayer 試合できるように、
- * 試合順をすべて生成する関数。
+ * 総当たりをベースに、ラウンドごとに試合順を作る。
  *
- * - スケジュールの並びは：
- *   全員の1試合目 → 全員の2試合目 → … の塊
- * - その中で、奇数回目の試合は「ランダム気味」、
- *   偶数回目の試合は「レートの近い相手」を優先
- * - 同じ日・同じ相手の対戦は避ける（sameDayPairs + この関数内で組んだ分）
- * - どうしても相手が見つからない場合、その選手はその回の試合はスキップ
- *   （＝結果として10試合未満になることもありうる）
+ * 仕様:
+ * - 基本は総当たり（全ペア N C 2）を候補とする
+ * - sameDayPairs に含まれるペア（その日すでに対戦済み）は除外
+ * - ラウンド制（1ラウンド = 各選手最大1試合）
+ *   ⇒ 誰かが2試合目に入る前に、他の人の1試合目を優先的に埋める
+ * - 奇数ラウンド:
+ *   - レーティング無視、ランダムに相手を選ぶ
+ * - 偶数ラウンド:
+ *   - その日まだ対戦していない相手の中から
+ *   - 「レーティングの高い人から順に」
+ *   - 「レート差が最も近い相手」を優先して選ぶ
  */
 export function generateFullSchedule(
   options: GenerateScheduleOptions
@@ -58,88 +61,168 @@ export function generateFullSchedule(
 
   if (players.length < 2) return [];
 
-  // id → Player のマップ
+  // いったんシャッフルして、毎回同じになりすぎないように
+  const shuffled = [...players].sort(() => Math.random() - 0.5);
+
+  // id → Player
   const playerMap = new Map<string, Player>();
-  players.forEach((p) => playerMap.set(p.id, p));
+  shuffled.forEach((p) => playerMap.set(p.id, p));
 
-  // 各選手の「今回スケジュール済み試合数」
+  // 各選手が今回スケジュール内で何試合こなしたか
   const matchCount = new Map<string, number>();
-  players.forEach((p) => matchCount.set(p.id, 0));
+  shuffled.forEach((p) => matchCount.set(p.id, 0));
 
-  // 「同じ日・同じ相手」を避けるためのペア集合
-  const usedPairs = new Set<string>(sameDayPairs);
+  // 「その日まだ対戦していないペア」の一覧
+  type Pair = { id1: string; id2: string };
+  const allPairs: Pair[] = [];
 
-  const schedule: MatchPair[] = [];
-
-  // 1試合目の塊 → 2試合目の塊 → … の順で作る
-  for (let nth = 1; nth <= matchesPerPlayer; nth++) {
-    // まだ nth 試合目が割り当てられていない選手たち
-    const needThisRound = players.filter(
-      (p) => (matchCount.get(p.id) ?? 0) < nth
-    );
-
-    // 毎回順番を少しシャッフルして偏りを減らす
-    const shuffled = [...needThisRound].sort(() => Math.random() - 0.5);
-
-    // この「nth 試合目の塊」で、まだマッチングされていない人の集合
-    const remainingIds = new Set<string>(shuffled.map((p) => p.id));
-
-    while (remainingIds.size >= 2) {
-      // 1人取り出す
-      const iterator = remainingIds.values();
-      const p1Id = iterator.next().value as string;
-      remainingIds.delete(p1Id);
-      const p1 = playerMap.get(p1Id);
-      if (!p1) continue;
-
-      // 対戦相手候補を探す
-      let chosenId: string | null = null;
-      let bestScore = Infinity;
-
-      for (const p2Id of remainingIds) {
-        const key = makePairKey(p1Id, p2Id);
-        if (usedPairs.has(key)) {
-          // 同じ日に対戦済みならスキップ
-          continue;
-        }
-
-        const p2 = playerMap.get(p2Id);
-        if (!p2) continue;
-
-        if (nth % 2 === 1) {
-          // 奇数回目：ランダム寄り → 最初に見つかった相手を採用
-          chosenId = p2Id;
-          break;
-        } else {
-          // 偶数回目：レート差が小さい相手を優先
-          const diff = Math.abs(p1.rating - p2.rating);
-          if (diff < bestScore) {
-            bestScore = diff;
-            chosenId = p2Id;
-          }
-        }
-      }
-
-      if (!chosenId) {
-        // この回では p1 の相手が見つからなかった → その人はこの回スキップ
+  for (let i = 0; i < shuffled.length; i++) {
+    for (let j = i + 1; j < shuffled.length; j++) {
+      const id1 = shuffled[i].id;
+      const id2 = shuffled[j].id;
+      const key = makePairKey(id1, id2);
+      if (sameDayPairs.has(key)) {
+        // その日すでに対戦済みなら候補に入れない
         continue;
       }
+      allPairs.push({ id1, id2 });
+    }
+  }
 
-      // ペア確定
-      remainingIds.delete(chosenId);
-      const p2 = playerMap.get(chosenId);
-      if (!p2) continue;
+  if (allPairs.length === 0) {
+    // これ以上組める試合がない
+    return [];
+  }
 
-      const pairKey = makePairKey(p1Id, chosenId);
-      usedPairs.add(pairKey);
+  // どのペアをすでにスケジュールに使ったか（allPairs の index ）
+  const usedPairIndex = new Set<number>();
 
-      schedule.push({
-        player1: p1,
-        player2: p2,
-      });
+  const schedule: MatchPair[] = [];
+  const maxRounds = matchesPerPlayer; // 原則 players.length - 1 を渡す
 
-      matchCount.set(p1Id, (matchCount.get(p1Id) ?? 0) + 1);
-      matchCount.set(chosenId, (matchCount.get(chosenId) ?? 0) + 1);
+  for (let round = 1; round <= maxRounds; round++) {
+    const matchesBeforeRound = schedule.length;
+
+    // このラウンドで既に割り当てられた選手
+    const usedThisRound = new Set<string>();
+
+    // このラウンドに出場できる候補（上限回数に達していない人）
+    const baseList = shuffled.filter(
+      (p) => (matchCount.get(p.id) ?? 0) < matchesPerPlayer
+    );
+
+    if (baseList.length < 2) {
+      break; // もうほとんど全員やり切った
+    }
+
+    let roundPlayers: Player[];
+
+    if (round % 2 === 1) {
+      // 奇数ラウンド: レーティング無視、ランダム順
+      roundPlayers = [...baseList].sort(() => Math.random() - 0.5);
+    } else {
+      // 偶数ラウンド: レーティング高い順
+      roundPlayers = [...baseList].sort((a, b) => b.rating - a.rating);
+    }
+
+    if (round % 2 === 1) {
+      // ===== 奇数ラウンド: ランダムマッチング =====
+      for (const p of roundPlayers) {
+        const pid = p.id;
+        if (usedThisRound.has(pid)) continue;
+        if ((matchCount.get(pid) ?? 0) >= matchesPerPlayer) continue;
+
+        // pid が含まれていて、まだ使っていない & このラウンドで相手が空いているペア
+        const candidateIdxs: number[] = [];
+        allPairs.forEach((pair, idx) => {
+          if (usedPairIndex.has(idx)) return;
+
+          let otherId: string | null = null;
+          if (pair.id1 === pid) otherId = pair.id2;
+          else if (pair.id2 === pid) otherId = pair.id1;
+          else return;
+
+          if (usedThisRound.has(otherId)) return;
+          if ((matchCount.get(otherId) ?? 0) >= matchesPerPlayer) return;
+
+          candidateIdxs.push(idx);
+        });
+
+        if (candidateIdxs.length === 0) continue;
+
+        const randomIdx =
+          candidateIdxs[Math.floor(Math.random() * candidateIdxs.length)];
+        const pair = allPairs[randomIdx];
+
+        usedPairIndex.add(randomIdx);
+        usedThisRound.add(pair.id1);
+        usedThisRound.add(pair.id2);
+
+        matchCount.set(pair.id1, (matchCount.get(pair.id1) ?? 0) + 1);
+        matchCount.set(pair.id2, (matchCount.get(pair.id2) ?? 0) + 1);
+
+        schedule.push({
+          player1: playerMap.get(pair.id1)!,
+          player2: playerMap.get(pair.id2)!,
+        });
+      }
+    } else {
+      // ===== 偶数ラウンド: 高レート優先 & レート差最小相手を選ぶ =====
+      for (const p of roundPlayers) {
+        const pid = p.id;
+        if (usedThisRound.has(pid)) continue;
+        if ((matchCount.get(pid) ?? 0) >= matchesPerPlayer) continue;
+
+        let bestIdx: number | null = null;
+        let bestDiff = Infinity;
+
+        allPairs.forEach((pair, idx) => {
+          if (usedPairIndex.has(idx)) return;
+
+          let otherId: string | null = null;
+          if (pair.id1 === pid) otherId = pair.id2;
+          else if (pair.id2 === pid) otherId = pair.id1;
+          else return;
+
+          if (usedThisRound.has(otherId)) return;
+          if ((matchCount.get(otherId) ?? 0) >= matchesPerPlayer) return;
+
+          const pRating = playerMap.get(pid)!.rating;
+          const oRating = playerMap.get(otherId)!.rating;
+          const diff = Math.abs(pRating - oRating);
+
+          if (diff < bestDiff) {
+            bestDiff = diff;
+            bestIdx = idx;
+          }
+        });
+
+        if (bestIdx === null) continue;
+
+        const pair = allPairs[bestIdx];
+
+        usedPairIndex.add(bestIdx);
+        usedThisRound.add(pair.id1);
+        usedThisRound.add(pair.id2);
+
+        matchCount.set(pair.id1, (matchCount.get(pair.id1) ?? 0) + 1);
+        matchCount.set(pair.id2, (matchCount.get(pair.id2) ?? 0) + 1);
+
+        schedule.push({
+          player1: playerMap.get(pair.id1)!,
+          player2: playerMap.get(pair.id2)!,
+        });
+      }
+    }
+
+    // このラウンドで1試合も作れなかったら、もう打ち止め
+    if (schedule.length === matchesBeforeRound) {
+      break;
+    }
+
+    // 全ペア使い切ったら終了
+    if (usedPairIndex.size === allPairs.length) {
+      break;
     }
   }
 
